@@ -302,7 +302,9 @@ def test_range_scan_routes_a_dst_day_and_skips_existing(tmp_path, capsys):
     assert day8.column("label").to_pylist() == ["march-8", "still-march-8"]
     assert day9.column("label").to_pylist() == ["march-9"]
     assert "null-row" not in day8.column("label").to_pylist()
-    assert "null_partition_rows=1 table=metra.Positions" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "null_partition_rows=1 table=metra.Positions" in out
+    assert "[1–2/2] metra.Positions 2026-03-08..2026-03-09 (one scan)" in out
     data_sql = next(sql for sql, _params in conn.statements if "group by" not in sql.lower())
     count_sql = next(sql for sql, _params in conn.statements if "group by" in sql.lower())
     assert "AT TIME ZONE" not in data_sql

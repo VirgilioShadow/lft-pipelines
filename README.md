@@ -70,6 +70,10 @@ python -m lft_pipelines.extract --tables metra.Positions,cta.CtaPositionSnapshot
 python -m lft_pipelines.extract --tables all --at-risk --start 2026-07-12 --end 2026-11-09 --out "$HOME/lft-archive" --pause-seconds 5
 ```
 
+## Progress output
+
+Before each partition the tool prints `[i/N] schema.table date=YYYY-MM-DD`. A range scan prints `[i–j/N] schema.table <first>..<last> (one scan)`. While rows are fetched, stderr shows the table, the day, rows so far, rows per second, and elapsed time, at most every 5 seconds on a terminal (one overwritten line) and every 30 seconds in a log. `--quiet` turns that heartbeat off. The plan lines stay. The run ends with counts of partitions written, skipped, and not settled, plus rows, mismatches, partial days, and total time.
+
 ## Why the versions are pinned
 
 The old training jobs installed SQLAlchemy without an exact pin. SQLAlchemy 2.1 changed PostgreSQL driver handling and those jobs failed on every run. This project does not use SQLAlchemy, pandas, or torch. It uses psycopg 3 only, and every dependency in `pyproject.toml` is pinned to an exact version, including `psycopg-binary`, so a later release cannot change the driver under a scheduled job.

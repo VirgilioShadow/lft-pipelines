@@ -21,6 +21,7 @@ from lft_pipelines.arrow_io import (
 )
 from lft_pipelines.bounds import CHICAGO, chicago_date, predicate_bounds
 from lft_pipelines.plan import build_plan, format_plan
+from lft_pipelines.progress import Heartbeat, plan_line, result_line, summary_line
 from lft_pipelines.registry import resolve_tables
 from lft_pipelines.sql import queries_for, range_queries
 from lft_pipelines.storage import manifest_rel, open_store, parquet_rel
@@ -110,6 +111,7 @@ def extract_partition(
     batch_size: int = BATCH_ROWS,
     extracted_at: datetime | None = None,
     partial_by_retention: bool = False,
+    progress: Heartbeat | None = None,
 ) -> PartitionResult:
     """Extract one Chicago day, or one full snapshot labeled with ``day``.
 
@@ -119,48 +121,54 @@ def extract_partition(
     with the number of rows written.
     """
 
-    manifest_path = manifest_rel(table.schema, table.table, day)
-    data_path = parquet_rel(table.schema, table.table, day)
-    if store.exists(manifest_path) and not overwrite:
-        return PartitionResult(table.key, day, "skipped", None)
+    try:
+        manifest_path = manifest_rel(table.schema, table.table, day)
+        data_path = parquet_rel(table.schema, table.table, day)
+        if store.exists(manifest_path) and not overwrite:
+            return PartitionResult(table.key, day, "skipped", None)
 
-    (select_sql, select_params), (count_sql, count_params) = queries_for(table, day)
-    when = extracted_at or datetime.now(timezone.utc)
-    stats = {"n": 0, "min": None, "max": None}
+        (select_sql, select_params), (count_sql, count_params) = queries_for(table, day)
+        when = extracted_at or datetime.now(timezone.utc)
+        stats = {"n": 0, "min": None, "max": None}
 
-    with conn.transaction():
-        with conn.cursor(name="lft_extract") as cur:
-            if hasattr(cur, "itersize"):
-                cur.itersize = batch_size
-            cur.execute(select_sql, select_params)
-            if not cur.description:
-                raise RuntimeError(f"{table.key} returned no column description")
-            schema = arrow_schema(cur.description)
-            names = column_names(cur.description)
-            column_index = names.index(table.column) if table.column else None
+        with conn.transaction():
+            with conn.cursor(name="lft_extract") as cur:
+                if hasattr(cur, "itersize"):
+                    cur.itersize = batch_size
+                cur.execute(select_sql, select_params)
+                if not cur.description:
+                    raise RuntimeError(f"{table.key} returned no column description")
+                schema = arrow_schema(cur.description)
+                names = column_names(cur.description)
+                column_index = names.index(table.column) if table.column else None
 
-            def batches():
-                while True:
-                    rows = cur.fetchmany(batch_size)
-                    if not rows:
-                        break
-                    stats["n"] += len(rows)
-                    if column_index is not None:
-                        for row in rows:
-                            _track(row[column_index], stats)
-                    yield rows_to_batch(rows, schema)
-                if stats["n"] == 0:
-                    yield empty_batch(schema)
+                def batches():
+                    while True:
+                        rows = cur.fetchmany(batch_size)
+                        if not rows:
+                            break
+                        stats["n"] += len(rows)
+                        if column_index is not None:
+                            for row in rows:
+                                _track(row[column_index], stats)
+                        if progress is not None:
+                            progress.note_batch(day, len(rows))
+                        yield rows_to_batch(rows, schema)
+                    if stats["n"] == 0:
+                        yield empty_batch(schema)
 
-            store.write_parquet(data_path, schema, batches())
+                store.write_parquet(data_path, schema, batches())
 
-        with conn.cursor() as cur:
-            cur.execute(count_sql, count_params)
-            counted = cur.fetchone()
-    db_count = int(counted[0]) if counted and counted[0] is not None else 0
-    manifest = _manifest(stats, db_count, schema, when, partial_by_retention)
-    store.write_json(manifest_path, manifest)
-    return PartitionResult(table.key, day, "wrote", manifest)
+            with conn.cursor() as cur:
+                cur.execute(count_sql, count_params)
+                counted = cur.fetchone()
+        db_count = int(counted[0]) if counted and counted[0] is not None else 0
+        manifest = _manifest(stats, db_count, schema, when, partial_by_retention)
+        store.write_json(manifest_path, manifest)
+        return PartitionResult(table.key, day, "wrote", manifest)
+    finally:
+        if progress is not None:
+            progress.finish()
 
 
 def _grouped_counts(rows) -> dict[date, int]:
@@ -181,6 +189,7 @@ def extract_range(
     overwrite: bool = False,
     batch_size: int = BATCH_ROWS,
     extracted_at: datetime | None = None,
+    progress: Heartbeat | None = None,
 ) -> tuple[list[PartitionResult], int]:
     """One SELECT for a contiguous span of an unindexed day table.
 
@@ -191,6 +200,31 @@ def extract_range(
     value is counted and not written.
     """
 
+    try:
+        return _extract_range(
+            conn,
+            items,
+            store,
+            overwrite=overwrite,
+            batch_size=batch_size,
+            extracted_at=extracted_at,
+            progress=progress,
+        )
+    finally:
+        if progress is not None:
+            progress.finish()
+
+
+def _extract_range(
+    conn,
+    items,
+    store,
+    *,
+    overwrite: bool,
+    batch_size: int,
+    extracted_at: datetime | None,
+    progress: Heartbeat | None,
+) -> tuple[list[PartitionResult], int]:
     if not items:
         return [], 0
     table = items[0].table
@@ -237,6 +271,8 @@ def extract_range(
                 schema = arrow_schema(cur.description)
                 names = column_names(cur.description)
                 column_index = names.index(table.column)
+                last_day = None
+                days_seen: set[date] = set()
                 while True:
                     rows = cur.fetchmany(batch_size)
                     if not rows:
@@ -251,9 +287,13 @@ def extract_range(
                             continue
                         _track(value, stats[day])
                         stats[day]["n"] += 1
+                        last_day = day
+                        days_seen.add(day)
                         buffers[day].append(row)
                         if len(buffers[day]) >= batch_size:
                             flush(day, schema)
+                    if progress is not None:
+                        progress.note_batch(last_day, len(rows), days_with_rows=len(days_seen))
             with conn.cursor() as cur:
                 cur.execute(count_sql, params)
                 grouped = cur.fetchall()
@@ -291,17 +331,24 @@ def run_plan(
     batch_size: int = BATCH_ROWS,
     sleep=time.sleep,
     extracted_at: datetime | None = None,
+    quiet: bool = False,
+    clock=time.monotonic,
 ) -> list[PartitionResult]:
     """Run a plan. Pause after a query, before the next query, to rest the database."""
 
+    started = clock()
     results: list[PartitionResult] = []
     queried = False
     index = 0
+    total = len(plan)
     while index < len(plan):
         item = plan[index]
         if item.status == "not_settled":
-            print(f"not settled {item.table.key} date={item.day.isoformat()}", flush=True)
-            results.append(PartitionResult(item.table.key, item.day, "not_settled", None))
+            began = clock()
+            print(plan_line(index + 1, index + 1, total, item.table.key, item.day, item.day, scanning=False), flush=True)
+            result = PartitionResult(item.table.key, item.day, "not_settled", None)
+            print(result_line(result, clock() - began), flush=True)
+            results.append(result)
             index += 1
             continue
         if item.table.scan_mode == "range" and item.table.partition == "day":
@@ -317,8 +364,22 @@ def run_plan(
             will_query = overwrite or any(
                 not store.exists(manifest_rel(part.table.schema, part.table.table, part.day)) for part in group
             )
+            print(
+                plan_line(
+                    index + 1,
+                    end,
+                    total,
+                    item.table.key,
+                    group[0].day,
+                    group[-1].day,
+                    scanning=will_query,
+                ),
+                flush=True,
+            )
             if will_query and queried and pause_seconds > 0:
                 sleep(pause_seconds)
+            began = clock()
+            beat = Heartbeat(item.table.key, clock=clock, enabled=not quiet, range_mode=True) if will_query else None
             grouped, nulls = extract_range(
                 conn,
                 group,
@@ -326,9 +387,11 @@ def run_plan(
                 overwrite=overwrite,
                 batch_size=batch_size,
                 extracted_at=extracted_at,
+                progress=beat,
             )
+            elapsed = clock() - began
             for result in grouped:
-                _print_result(result)
+                print(result_line(result, elapsed), flush=True)
             if will_query:
                 print(f"null_partition_rows={nulls} table={item.table.key}", flush=True)
                 if any(result.status == "wrote" for result in grouped):
@@ -338,8 +401,11 @@ def run_plan(
             continue
         path = manifest_rel(item.table.schema, item.table.table, item.day)
         will_query = overwrite or not store.exists(path)
+        print(plan_line(index + 1, index + 1, total, item.table.key, item.day, item.day, scanning=False), flush=True)
         if will_query and queried and pause_seconds > 0:
             sleep(pause_seconds)
+        began = clock()
+        beat = Heartbeat(item.table.key, clock=clock, enabled=not quiet) if will_query else None
         result = extract_partition(
             conn,
             item.table,
@@ -349,27 +415,15 @@ def run_plan(
             batch_size=batch_size,
             extracted_at=extracted_at,
             partial_by_retention=item.partial_by_retention,
+            progress=beat,
         )
-        _print_result(result)
+        print(result_line(result, clock() - began), flush=True)
         if result.status == "wrote":
             queried = True
         results.append(result)
         index += 1
+    print(summary_line(results, clock() - started), flush=True)
     return results
-
-
-def _print_result(result: PartitionResult) -> None:
-    if result.status == "wrote":
-        mismatch = result.manifest["mismatch"] if result.manifest else False
-        rows = result.manifest["row_count"] if result.manifest else 0
-        partial = result.manifest["partial_by_retention"] if result.manifest else False
-        print(
-            f"wrote {result.table} date={result.day.isoformat()} rows={rows} "
-            f"mismatch={str(mismatch).lower()} partial_by_retention={str(partial).lower()}",
-            flush=True,
-        )
-        return
-    print(f"skipped {result.table} date={result.day.isoformat()}", flush=True)
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -389,6 +443,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Drop days retention has already deleted, and run the shortest windows first",
     )
+    parser.add_argument("--quiet", action="store_true", help="Turn off stderr heartbeats")
     return parser.parse_args(argv)
 
 
@@ -418,7 +473,14 @@ def main(argv: list[str] | None = None) -> int:
     store = open_store(args.out)
     conn = connect()
     try:
-        run_plan(conn, plan, store, overwrite=args.overwrite, pause_seconds=args.pause_seconds)
+        run_plan(
+            conn,
+            plan,
+            store,
+            overwrite=args.overwrite,
+            pause_seconds=args.pause_seconds,
+            quiet=args.quiet,
+        )
     finally:
         conn.close()
     return 0
