@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lft-pipelines"
+version = "0.1.0"
+description = "Read-only, day-partitioned Parquet extracts of Lakefront Rails history."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Paul M Gonzalez" }]
+dependencies = [
+    "psycopg[binary]==3.3.8",
+    "psycopg-binary==3.3.8",
+    "pyarrow==26.0.1",
+    "python-dotenv==1.2.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
