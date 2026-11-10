@@ -7,6 +7,7 @@ deleted (object storage). Readers never see a half-written Parquet file.
 import io
 import json
 import os
+from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -69,6 +70,19 @@ class LocalStore:
         """A writer that stays open across batches, then publishes once."""
 
         return LocalParquetSink(self._target(rel), schema)
+
+    def read_json(self, rel: str) -> dict | None:
+        """Read one JSON object, or None when the file is absent."""
+
+        path = self._target(rel)
+        if not path.is_file():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def list_manifests(self, schema: str, table: str, start: date, end: date) -> list[tuple[date, dict]]:
+        """Manifests for ``[start, end)``, oldest day first. Missing days are omitted."""
+
+        return _manifests_between(self, schema, table, start, end)
 
 
 class LocalParquetSink:
@@ -147,6 +161,23 @@ class S3Store:
         self.filesystem.copy_file(tmp, final)
         self.filesystem.delete_file(tmp)
 
+    def read_json(self, rel: str) -> dict | None:
+        """Read one JSON object, or None when the key is absent."""
+
+        key = self._key(rel)
+        from pyarrow.fs import FileType
+
+        info = self.filesystem.get_file_info(key)
+        if info.type != FileType.File:
+            return None
+        with self.filesystem.open_input_stream(key) as source:
+            return json.loads(source.read().decode("utf-8"))
+
+    def list_manifests(self, schema: str, table: str, start: date, end: date) -> list[tuple[date, dict]]:
+        """Manifests for ``[start, end)``, oldest day first. Missing days are omitted."""
+
+        return _manifests_between(self, schema, table, start, end)
+
 
 class S3ParquetSink:
     """Parquet on a ``.partial`` key. ``publish`` copies it onto the final key."""
@@ -221,6 +252,26 @@ class MemoryFilesystem:
         if key in self.data:
             return FileInfo(key, type=FileType.File, size=len(self.data[key]))
         return FileInfo(key, type=FileType.NotFound)
+
+    def open_input_stream(self, key: str):
+        """Bytes of one stored object. Tests only."""
+
+        if key not in self.data:
+            raise FileNotFoundError(key)
+        return io.BytesIO(self.data[key])
+
+
+def _manifests_between(store, schema: str, table: str, start: date, end: date) -> list[tuple[date, dict]]:
+    """Read ``_manifest.json`` for each day in ``[start, end)`` that has one."""
+
+    found = []
+    day = start
+    while day < end:
+        payload = store.read_json(manifest_rel(schema, table, day))
+        if payload is not None:
+            found.append((day, payload))
+        day += timedelta(days=1)
+    return found
 
 
 def spaces_filesystem(env: dict):

@@ -70,6 +70,22 @@ python -m lft_pipelines.extract --tables metra.Positions,cta.CtaPositionSnapshot
 python -m lft_pipelines.extract --tables all --at-risk --start 2026-07-12 --end 2026-11-09 --out "$HOME/lft-archive" --pause-seconds 5
 ```
 
+## One table at a time
+
+`run_table` plans one registry table with the same at-risk and settle rules as the CLI, then extracts it. `scan_mode="range"` stays one SELECT. The CLI calls `run_table` once per table. Days that already have a manifest are not listed one by one; the run prints `skipped N already-written partitions`.
+
+## Validate and compare
+
+`lft_pipelines.validate` reads manifests for a table. A settled day still inside retention fails when its manifest is missing or `mismatch` is true. Row counts outside half to double the trailing 7-day median (only with at least 3 earlier days), timestamps outside the Chicago day, and column changes are warnings.
+
+```sh
+python -m lft_pipelines.compare --a "$HOME/lft-archive" --b /tmp/shadow --start 2026-11-01 --end 2026-11-04 --tables all
+```
+
+The command compares `row_count`, min, max, and columns. It ignores `extracted_at` and `tool_version`. A partition whose manifest has `partial_by_retention` on either side is counted as `skipped_partial` and is not a difference. Exit 1 means any other difference, or a partition on only one side.
+
+The nightly Airflow DAG, the shadow-prefix cutover, and the Droplet runbook are in [airflow/README.md](airflow/README.md).
+
 ## Progress output
 
 Before each partition the tool prints `[i/N] schema.table date=YYYY-MM-DD`. A range scan prints `[i–j/N] schema.table <first>..<last> (one scan)`. While rows are fetched, stderr shows the table, the day, rows so far, rows per second, and elapsed time, at most every 5 seconds on a terminal (one overwritten line) and every 30 seconds in a log. `--quiet` turns that heartbeat off. The plan lines stay. The run ends with counts of partitions written, skipped, and not settled, plus rows, mismatches, partial days, and total time.
@@ -87,7 +103,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests use a fake cursor. They do not need a database or Spaces credentials. GitHub Actions runs that same `pytest` and nothing else.
+The tests use a fake cursor. They do not need a database or Spaces credentials. GitHub Actions runs that `pytest`, then builds the Airflow image and imports the DAG.
 
 ## Read-only database user
 

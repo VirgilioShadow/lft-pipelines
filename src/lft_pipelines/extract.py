@@ -21,7 +21,7 @@ from lft_pipelines.arrow_io import (
 )
 from lft_pipelines.bounds import CHICAGO, chicago_date, predicate_bounds
 from lft_pipelines.plan import build_plan, format_plan
-from lft_pipelines.progress import Heartbeat, plan_line, result_line, summary_line
+from lft_pipelines.progress import Heartbeat, summary_line
 from lft_pipelines.registry import resolve_tables
 from lft_pipelines.sql import queries_for, range_queries
 from lft_pipelines.storage import manifest_rel, open_store, parquet_rel
@@ -334,94 +334,26 @@ def run_plan(
     quiet: bool = False,
     clock=time.monotonic,
 ) -> list[PartitionResult]:
-    """Run a plan. Pause after a query, before the next query, to rest the database."""
+    """Run a plan. Pause after a query, before the next query, to rest the database.
+
+    Each table is handed to ``run_table``'s executor. Skipped days are one total.
+    """
+
+    from lft_pipelines.execute import run_groups
 
     started = clock()
-    results: list[PartitionResult] = []
-    queried = False
-    index = 0
-    total = len(plan)
-    while index < len(plan):
-        item = plan[index]
-        if item.status == "not_settled":
-            began = clock()
-            print(plan_line(index + 1, index + 1, total, item.table.key, item.day, item.day, scanning=False), flush=True)
-            result = PartitionResult(item.table.key, item.day, "not_settled", None)
-            print(result_line(result, clock() - began), flush=True)
-            results.append(result)
-            index += 1
-            continue
-        if item.table.scan_mode == "range" and item.table.partition == "day":
-            end = index + 1
-            while (
-                end < len(plan)
-                and plan[end].status == "extract"
-                and plan[end].table.key == item.table.key
-                and plan[end].table.scan_mode == "range"
-            ):
-                end += 1
-            group = plan[index:end]
-            will_query = overwrite or any(
-                not store.exists(manifest_rel(part.table.schema, part.table.table, part.day)) for part in group
-            )
-            print(
-                plan_line(
-                    index + 1,
-                    end,
-                    total,
-                    item.table.key,
-                    group[0].day,
-                    group[-1].day,
-                    scanning=will_query,
-                ),
-                flush=True,
-            )
-            if will_query and queried and pause_seconds > 0:
-                sleep(pause_seconds)
-            began = clock()
-            beat = Heartbeat(item.table.key, clock=clock, enabled=not quiet, range_mode=True) if will_query else None
-            grouped, nulls = extract_range(
-                conn,
-                group,
-                store,
-                overwrite=overwrite,
-                batch_size=batch_size,
-                extracted_at=extracted_at,
-                progress=beat,
-            )
-            elapsed = clock() - began
-            for result in grouped:
-                print(result_line(result, elapsed), flush=True)
-            if will_query:
-                print(f"null_partition_rows={nulls} table={item.table.key}", flush=True)
-                if any(result.status == "wrote" for result in grouped):
-                    queried = True
-            results.extend(grouped)
-            index = end
-            continue
-        path = manifest_rel(item.table.schema, item.table.table, item.day)
-        will_query = overwrite or not store.exists(path)
-        print(plan_line(index + 1, index + 1, total, item.table.key, item.day, item.day, scanning=False), flush=True)
-        if will_query and queried and pause_seconds > 0:
-            sleep(pause_seconds)
-        began = clock()
-        beat = Heartbeat(item.table.key, clock=clock, enabled=not quiet) if will_query else None
-        result = extract_partition(
-            conn,
-            item.table,
-            item.day,
-            store,
-            overwrite=overwrite,
-            batch_size=batch_size,
-            extracted_at=extracted_at,
-            partial_by_retention=item.partial_by_retention,
-            progress=beat,
-        )
-        print(result_line(result, clock() - began), flush=True)
-        if result.status == "wrote":
-            queried = True
-        results.append(result)
-        index += 1
+    results = run_groups(
+        conn,
+        plan,
+        store,
+        overwrite=overwrite,
+        pause_seconds=pause_seconds,
+        quiet=quiet,
+        batch_size=batch_size,
+        extracted_at=extracted_at,
+        sleep=sleep,
+        clock=clock,
+    )
     print(summary_line(results, clock() - started), flush=True)
     return results
 
@@ -453,13 +385,8 @@ def main(argv: list[str] | None = None) -> int:
         tables = resolve_tables(args.tables)
         start = date.fromisoformat(args.start)
         end = date.fromisoformat(args.end)
-        plan = build_plan(
-            tables,
-            start,
-            end,
-            at_risk=args.at_risk,
-            today=datetime.now(CHICAGO).date(),
-        )
+        today = datetime.now(CHICAGO).date()
+        plan = build_plan(tables, start, end, at_risk=args.at_risk, today=today)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -469,18 +396,43 @@ def main(argv: list[str] | None = None) -> int:
 
     from dotenv import load_dotenv
 
+    from lft_pipelines.execute import run_table
+
     load_dotenv()
+    ordered: list = []
+    seen: set[str] = set()
+    for item in plan:
+        if item.table.key not in seen:
+            seen.add(item.table.key)
+            ordered.append(item.table)
     store = open_store(args.out)
     conn = connect()
+    started = time.monotonic()
     try:
-        run_plan(
-            conn,
-            plan,
-            store,
-            overwrite=args.overwrite,
-            pause_seconds=args.pause_seconds,
-            quiet=args.quiet,
-        )
+        results = []
+        prior = False
+        skipped = 0
+        for table in ordered:
+            part = run_table(
+                conn,
+                table,
+                store,
+                start=start,
+                end=end,
+                today=today,
+                overwrite=args.overwrite,
+                pause_seconds=args.pause_seconds,
+                at_risk=args.at_risk,
+                quiet=args.quiet,
+                prior_query=prior,
+                announce_skips=False,
+            )
+            prior = prior or any(result.status == "wrote" for result in part)
+            skipped += sum(1 for result in part if result.status == "skipped")
+            results.extend(part)
+        if skipped:
+            print(f"skipped {skipped} already-written partitions", flush=True)
+        print(summary_line(results, time.monotonic() - started), flush=True)
     finally:
         conn.close()
     return 0

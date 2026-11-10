@@ -16,3 +16,12 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run tests
         run: pytest
+
+  airflow-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Airflow image
+        run: docker build -f airflow/Dockerfile -t lft-airflow:ci .
+      - name: Import the archive DAG
+        run: docker run --rm --entrypoint python lft-airflow:ci /opt/airflow/dagbag_check.py

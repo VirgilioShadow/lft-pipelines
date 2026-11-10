@@ -108,7 +108,8 @@ def test_summary_counts_written_skipped_unsettled_mismatch_and_partial(tmp_path,
     out = capsys.readouterr().out
     assert "[1/3] metra.StopDelayForecast date=2026-11-07" in out
     assert "mismatch=true partial_by_retention=true" in out
-    assert "[2/3] metra.StopDelayForecast date=2026-11-08" in out
-    assert "skipped metra.StopDelayForecast date=2026-11-08" in out
+    assert "[2/3] metra.StopDelayForecast date=2026-11-08" not in out
+    assert "skipped 1 already-written partitions" in out
+    assert "skipped metra.StopDelayForecast date=2026-11-08" not in out
     assert "not settled metra.StopDelayForecast date=2026-11-09" in out
     assert "summary written=1 skipped=1 not_settled=1 rows=1 mismatches=1 partial_by_retention=1 " in out

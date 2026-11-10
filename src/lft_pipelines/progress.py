@@ -82,7 +82,8 @@ class Heartbeat:
         if self.range_mode:
             text += f" days_with_rows={self.days_with_rows}"
         if self.tty:
-            self.stream.write("\r" + text)
+            # \x1b[K clears the rest of the row so a shorter update does not leave old text.
+            self.stream.write("\r" + text + "\x1b[K")
             self._open = True
         else:
             self.stream.write(text + "\n")
