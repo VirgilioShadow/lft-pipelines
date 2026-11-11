@@ -32,6 +32,9 @@ class TableSpec:
     scan_mode: str
     # Plain name for Discord only. Queries and paths keep ``schema.table``.
     label: str
+    # False when row volume follows an irregular producer, such as a
+    # scheduled ML job. Size is not compared with a median. Other checks stay.
+    row_band: bool = True
 
     @property
     def key(self) -> str:
@@ -47,8 +50,9 @@ def _day(
     label: str,
     settle_days: int = 0,
     scan_mode: str = "per_day",
+    row_band: bool = True,
 ) -> TableSpec:
-    return TableSpec(schema, table, "day", column, kind, retention, settle_days, scan_mode, label)
+    return TableSpec(schema, table, "day", column, kind, retention, settle_days, scan_mode, label, row_band)
 
 
 def _snapshot(schema: str, table: str, label: str) -> TableSpec:
@@ -63,10 +67,10 @@ TABLES: tuple[TableSpec, ...] = (
     _day("metra", "Positions", "recorded_at", "timestamptz", 30, "train positions", scan_mode="range"),
     _day("cta", "CtaTripUpdateSnapshot", "polled_at", "timestamptz", 120, "CTA trip updates"),
     _day("cta", "CtaPositionSnapshot", "polled_at", "timestamptz", 30, "CTA positions"),
-    _day("metra", "DelayForecast", "predicted_at", "timestamptz", 180, "delay forecasts"),
+    _day("metra", "DelayForecast", "predicted_at", "timestamptz", 180, "delay forecasts", row_band=False),
     # StopDelayForecast is deleted by service_date after 2 days
     # (forecast job and the ingest retention table). Not in the 2:45–3:40 jobs.
-    _day("metra", "StopDelayForecast", "service_date", "date", 2, "stop delay forecasts"),
+    _day("metra", "StopDelayForecast", "service_date", "date", 2, "stop delay forecasts", row_band=False),
     # Kept. Still partitioned by the timestamp or service date they already have.
     _day("metra", "SpeedObservation", "recorded_at", "timestamptz", None, "speed observations"),
     _day("weather", "WeatherObservation", "observed_at", "timestamptz", None, "weather observations"),

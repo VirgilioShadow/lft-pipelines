@@ -103,6 +103,7 @@ def test_validate_fail_and_warn_and_short_history():
         min_ts="2026-11-01T00:00:00+00:00",
         columns=[{"name": "other", "type": "int64"}],
     )
+    full[days[6]] = _manifest(80, days[6])
     result = validate_table(table, today, full, start=start, end=end)
     codes = {item.code for item in result.findings}
     assert "mismatch" in codes
@@ -111,7 +112,7 @@ def test_validate_fail_and_warn_and_short_history():
     assert "columns" in codes
     assert result.ok is False
     row_band = next(item.message for item in result.findings if item.code == "row_band")
-    assert row_band == "train positions, Nov 7: 700% more rows than the 7-day median"
+    assert row_band == "train positions, Nov 9: 700% more rows than the weekday median"
 
 
 def test_compare_equal_different_and_one_sided(tmp_path, capsys):

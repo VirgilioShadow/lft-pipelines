@@ -29,6 +29,7 @@ class ValidationResult:
 
     table: str
     findings: list[Finding] = field(default_factory=list)
+    fresh_days: set[date] | None = None
 
     @property
     def ok(self) -> bool:
@@ -38,9 +39,21 @@ class ValidationResult:
 
     @property
     def warnings(self) -> list[Finding]:
-        """Warning findings only."""
+        """Warning findings only. The task log prints these."""
 
         return [item for item in self.findings if item.level == "warn"]
+
+    @property
+    def digest_warnings(self) -> list[Finding]:
+        """Warnings for partitions written this run.
+
+        ``fresh_days is None`` means the caller is not a nightly run, so every
+        warning is included. An empty set posts nothing.
+        """
+
+        if self.fresh_days is None:
+            return self.warnings
+        return [item for item in self.warnings if item.day in self.fresh_days]
 
 
 def validate_table(
@@ -50,15 +63,18 @@ def validate_table(
     *,
     start: date,
     end: date,
+    fresh_days: set[date] | None = None,
 ) -> ValidationResult:
     """Validate settled, in-retention days in ``[start, end)``.
 
     ``today`` is the Chicago date of the run. ``manifests`` may also hold the
     snapshot labeled with ``today``. A day is in retention when the table is
-    not pruned, or ``day >= today - retention_days``.
+    not pruned, or ``day >= today - retention_days``. ``fresh_days`` are the
+    partitions this run wrote. Hard failures still cover the whole window.
+    Only the digest is limited to ``fresh_days``.
     """
 
-    result = ValidationResult(table.key)
+    result = ValidationResult(table.key, fresh_days=fresh_days)
     if table.partition == "snapshot":
         _check_snapshot(table, today, manifests, result)
         return result
@@ -135,10 +151,14 @@ def _inside_day(value, column_kind: str, day: date) -> bool:
 
 
 def _size(table: TableSpec, day: date, payload: dict, manifests: dict[date, dict], result: ValidationResult) -> None:
-    prior = [manifests[key].get("row_count") or 0 for key in sorted(manifests) if key < day][-7:]
-    if len(prior) < 3:
+    if not table.row_band:
+        return
+    prior = _same_type_counts(day, manifests)
+    if sum(1 for count in prior if count > 0) < 3:
         return
     middle = float(median(prior))
+    if middle <= 0:
+        return
     rows = payload.get("row_count") or 0
     low = 0.5 * middle
     high = 2 * middle
@@ -146,17 +166,37 @@ def _size(table: TableSpec, day: date, payload: dict, manifests: dict[date, dict
         result.findings.append(Finding("warn", "row_band", day, _row_band_message(table, day, rows, middle)))
 
 
+def _same_type_counts(day: date, manifests: dict[date, dict]) -> list[float]:
+    """Row counts from up to the last four earlier days of the same type.
+
+    Saturday and Sunday are one type. Monday through Friday are the other.
+    Metra holidays are not split out; a holiday weekday uses the weekday median.
+    """
+
+    weekend = _is_weekend(day)
+    keys = [key for key in manifests if key < day and _is_weekend(key) == weekend]
+    keys.sort()
+    return [float(manifests[key].get("row_count") or 0) for key in keys[-4:]]
+
+
+def _is_weekend(day: date) -> bool:
+    """True for Saturday and Sunday on the Chicago calendar date."""
+
+    return day.weekday() >= 5
+
+
 def _row_band_message(table: TableSpec, day: date, rows: float, middle: float) -> str:
-    """How far this day sits from the recent median, in plain language."""
+    """How far this day sits from the same-type median, in plain language."""
 
     subject = _subject(table, day)
+    kind = "weekend" if _is_weekend(day) else "weekday"
     if middle <= 0:
         return f"{subject}: row count is outside the recent range"
     if rows < middle:
         percent = round((1 - rows / middle) * 100)
-        return f"{subject}: {percent}% fewer rows than the 7-day median"
+        return f"{subject}: {percent}% fewer rows than the {kind} median"
     percent = round((rows / middle - 1) * 100)
-    return f"{subject}: {percent}% more rows than the 7-day median"
+    return f"{subject}: {percent}% more rows than the {kind} median"
 
 
 def _columns(table: TableSpec, day: date, payload: dict, previous: dict, result: ValidationResult) -> None:
@@ -173,6 +213,34 @@ def _subject(table: TableSpec, day: date) -> str:
 
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def fresh_days_from_extracts(extracted: list) -> dict[str, set[date]]:
+    """Map each table to the Chicago dates this run wrote.
+
+    A mapped task that failed has no return value and contributes nothing.
+    Its missing manifests still fail the night.
+    """
+
+    found: dict[str, set[date]] = {}
+    for item in extracted or []:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("table")
+        if not key:
+            continue
+        days = found.setdefault(str(key), set())
+        for raw in item.get("written") or []:
+            days.add(date.fromisoformat(str(raw)[:10]))
+    return found
+
+
+def require_night_ok(failed_names: list[str]) -> None:
+    """Raise when any table failed. A partition from an earlier night still counts."""
+
+    if failed_names:
+        names = ", ".join(failed_names)
+        raise RuntimeError(f"archive check failed for {names}")
 
 
 def _previous_manifest(manifests: dict[date, dict], day: date) -> dict | None:

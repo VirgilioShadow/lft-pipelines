@@ -76,7 +76,7 @@ python -m lft_pipelines.extract --tables all --at-risk --start 2026-07-12 --end 
 
 ## Validate and compare
 
-`lft_pipelines.validate` reads manifests for a table. A settled day still inside retention fails when its manifest is missing or `mismatch` is true. Row counts outside half to double the trailing 7-day median (only with at least 3 earlier days), timestamps outside the Chicago day, and column changes are warnings.
+`lft_pipelines.validate` reads manifests for a table. A settled day still inside retention fails when its manifest is missing or `mismatch` is true. Row counts outside half to double the median of up to four earlier days of the same type (weekday, or Saturday and Sunday; at least three of them nonzero) are warnings. `metra.DelayForecast` and `metra.StopDelayForecast` skip that size check. Timestamps outside the Chicago day and column changes are warnings. The nightly digest posts a warning only for a partition that run wrote. Metra holidays are compared as weekdays.
 
 ```sh
 python -m lft_pipelines.compare --a "$HOME/lft-archive" --b /tmp/shadow --start 2026-11-01 --end 2026-11-04 --tables all

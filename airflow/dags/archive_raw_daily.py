@@ -96,14 +96,15 @@ def archive_raw_daily():
         return {
             "table": table.key,
             "wrote": sum(1 for item in results if item.status == "wrote"),
+            "written": [item.day.isoformat() for item in results if item.status == "wrote"],
             "skipped": sum(1 for item in results if item.status == "skipped"),
             "not_settled": sum(1 for item in results if item.status == "not_settled"),
             "mismatches": sum(1 for item in results if item.manifest and item.manifest.get("mismatch")),
         }
 
     @task.external_python(python=PYTHON, trigger_rule="all_done", expect_airflow=False)
-    def validate(specs: list[dict]) -> dict:
-        """Fail when a settled manifest is missing or mismatched. Warn once per night.
+    def validate(specs: list[dict], extracted: list[dict]) -> dict:
+        """Fail when a settled manifest is missing or mismatched. Warn once per new partition.
 
         Imports stay inside this function. Only its source is sent to the venv.
         """
@@ -114,7 +115,7 @@ def archive_raw_daily():
         from lft_pipelines.alerts import post_discord, warning_message
         from lft_pipelines.registry import resolve_tables
         from lft_pipelines.storage import open_store
-        from lft_pipelines.validate import format_validation, validate_table
+        from lft_pipelines.validate import format_validation, fresh_days_from_extracts, require_night_ok, validate_table
 
         if not specs:
             raise RuntimeError("no table specs")
@@ -122,6 +123,7 @@ def archive_raw_daily():
         start = date.fromisoformat(specs[0]["start"])
         end = date.fromisoformat(specs[0]["end"])
         store = open_store(os.environ["ARCHIVE_URL"])
+        fresh = fresh_days_from_extracts(extracted)
         warnings = []
         failed_names = []
         for spec in specs:
@@ -133,17 +135,15 @@ def archive_raw_daily():
                 )
                 if payload is not None:
                     found[today] = payload
-            result = validate_table(table, today, found, start=start, end=end)
+            result = validate_table(table, today, found, start=start, end=end, fresh_days=fresh.get(table.key, set()))
             print(format_validation(result))
             if not result.ok:
                 failed_names.append(table.label)
-            warnings.extend(item.message for item in result.warnings)
+            warnings.extend(item.message for item in result.digest_warnings)
         url = os.environ.get("ALERT_WEBHOOK_URL") or ""
         if warnings and url:
             post_discord(url, warning_message(today, warnings))
-        if failed_names:
-            names = ", ".join(failed_names)
-            raise RuntimeError(f"archive check failed for {names}")
+        require_night_ok(failed_names)
         return {"warnings": len(warnings)}
 
     @task
@@ -159,8 +159,7 @@ def archive_raw_daily():
 
     specs = plan_run()
     extracted = extract_table.expand(spec=specs)
-    checked = validate(specs)
-    checked.set_upstream(extracted)
+    checked = validate(specs, extracted)
     beat = heartbeat(checked)
     beat.set_upstream(extracted)
 
