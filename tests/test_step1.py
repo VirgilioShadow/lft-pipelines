@@ -326,3 +326,29 @@ def _unbound(fn: ast.FunctionDef) -> set[str]:
     for stmt in fn.body:
         Names().visit(stmt)
     return used - defined - imported - set(dir(builtins))
+
+
+def test_post_discord_sends_a_named_user_agent(monkeypatch):
+    """Discord rejects the default urllib agent with 403, so the post names itself."""
+
+    import lft_pipelines.alerts as alerts
+
+    seen = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b""
+
+    def fake_urlopen(request, timeout):
+        seen["agent"] = request.get_header("User-agent")
+        return _Response()
+
+    monkeypatch.setattr(alerts.urllib.request, "urlopen", fake_urlopen)
+    alerts.post_discord("https://example.invalid/hook", "hello")
+    assert seen["agent"].startswith("lft-pipelines-alerts/")

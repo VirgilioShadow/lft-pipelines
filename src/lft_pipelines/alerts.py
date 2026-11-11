@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 MAX_CHARS = 1800
 DETAIL_LINES = 5
+USER_AGENT = "lft-pipelines-alerts/1.0 (+https://github.com/VirgilioShadow/lft-pipelines)"
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _BRACKET_STAMP = re.compile(r"^\[[^\]]*20\d{2}[^\]]*\]\s*")
@@ -82,7 +83,8 @@ def post_discord(url: str, text: str) -> None:
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"content-type": "application/json"},
+        # Discord's edge returns 403 to the default "Python-urllib" agent.
+        headers={"content-type": "application/json", "user-agent": USER_AGENT},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=10) as response:
