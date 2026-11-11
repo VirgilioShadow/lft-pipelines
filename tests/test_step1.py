@@ -15,6 +15,7 @@ from lft_pipelines.extract import run_plan
 from lft_pipelines.plan import WorkItem, build_plan
 from lft_pipelines.registry import resolve_tables
 from lft_pipelines.storage import open_store
+from lft_pipelines.alerts import warning_message
 from lft_pipelines.validate import validate_table
 
 from tests.fakes import FakeConn
@@ -109,6 +110,8 @@ def test_validate_fail_and_warn_and_short_history():
     assert "outside_day" in codes
     assert "columns" in codes
     assert result.ok is False
+    row_band = next(item.message for item in result.findings if item.code == "row_band")
+    assert row_band == "train positions, Nov 7: 700% more rows than the 7-day median"
 
 
 def test_compare_equal_different_and_one_sided(tmp_path, capsys):
@@ -149,22 +152,94 @@ def test_lookback_around_dst():
 def test_failure_message_hides_env_and_truncates(monkeypatch):
     monkeypatch.setenv("ALERT_WEBHOOK_URL", SECRET)
     monkeypatch.setenv("DATABASE_URL", SECRET)
+    monkeypatch.setenv("SPACES_SECRET", SECRET)
+    headline = "🔴 Nightly archive failed: train positions (metra.Positions), Nov 11"
     text = failure_message(
         {
             "dag_id": "archive_raw_daily",
             "task_id": "extract_table",
-            "try_number": 2,
+            "try_number": 3,
             "table": "metra.Positions",
-            "day": "2026-11-09",
-            "log_lines": [f"row {index} " + ("x" * 200) for index in range(30)],
+            "day": "2026-11-11",
+            "today": "2026-11-11",
+            "exception_line": "connection to the database was refused",
+            "log_lines": [f"\x1b[31m2026-11-11T06:31:04Z row {index} " + ("x" * 400) for index in range(8)],
         }
     )
     assert SECRET not in text
     assert len(text) <= 1800
-    assert text.endswith("...")
-    assert "try=2" in text
-    assert "table=metra.Positions" in text
+    assert text.splitlines()[0] == headline
+    assert "failed 3 times" in text
+    assert "connection to the database was refused" in text
+    assert "safe until Dec 11" in text
+    assert "nothing tonight; if this repeats tomorrow, tell Claude" in text
+    assert "\x1b" not in text
+    assert "2026-11-11T06:31:04Z" not in text
+    detail = text.split("```")[1].strip().splitlines()
+    assert 0 < len(detail) <= 5
     assert json.dumps({"content": text})
+
+
+def test_alert_risk_dates_warnings_and_secret(monkeypatch):
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", SECRET)
+    monkeypatch.setenv("ARCHIVE_URL", SECRET)
+    digest = warning_message(
+        date(2026, 11, 11),
+        ["train positions, Nov 9: 41% fewer rows than the 7-day median"],
+    )
+    assert digest.splitlines()[0] == "🟡 Archive check: 1 warning for Nov 11"
+    assert "- train positions, Nov 9: 41% fewer rows than the 7-day median" in digest
+    assert SECRET not in digest
+
+    kept = failure_message(
+        {
+            "task_id": "extract_table",
+            "try_number": 1,
+            "table": "metra.SpeedObservation",
+            "day": "2026-11-11",
+            "today": "2026-11-11",
+        }
+    )
+    assert kept.splitlines()[0] == "🔴 Nightly archive failed: speed observations (metra.SpeedObservation), Nov 11"
+    assert "Risk: none, the database keeps this table" in kept
+
+    boundary = failure_message(
+        {
+            "task_id": "extract_table",
+            "try_number": 1,
+            "table": "metra.StopDelayForecast",
+            "day": "2026-01-31",
+            "today": "2026-01-31",
+        }
+    )
+    assert "safe until Feb 2" in boundary
+
+    lost = failure_message(
+        {
+            "task_id": "extract_table",
+            "try_number": 2,
+            "table": "metra.Positions",
+            "day": "2026-10-01",
+            "today": "2026-11-11",
+            "exception_line": "timeout",
+        }
+    )
+    assert "ended Oct 31" in lost
+    assert "lost unless it was already archived" in lost
+    assert SECRET not in lost
+
+    check = failure_message(
+        {
+            "task_id": "validate",
+            "try_number": 3,
+            "day": "2026-11-11",
+            "today": "2026-11-11",
+            "exception_line": "archive check failed for train positions",
+        }
+    )
+    assert check.splitlines()[0] == "🔴 Archive check failed, Nov 11"
+    assert "failed 3 times" in check
+    assert "check the archive before cutover; tell Claude" in check
 
 
 def test_compare_skips_partial_retention(tmp_path, capsys):

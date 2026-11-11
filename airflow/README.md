@@ -24,6 +24,21 @@ Copy the names from `airflow/airflow.env.example`. Fill them on the Droplet. Do 
 
 Postgres receives only `POSTGRES_USER`, `POSTGRES_DB`, and `POSTGRES_PASSWORD`. Compose fills that password, and the Airflow metadata URL, from the shell, so start with `--env-file` (below). The other secrets stay on the Airflow services. `AIRFLOW_ENV_FILE` must point at the same file, because that is what the Airflow services load.
 
+## Alert preview
+
+From the repo root, print three sample messages (a pruned-table failure, a kept-table failure, and the nightly warnings). This does not post:
+
+```sh
+python3 airflow/preview_alerts.py
+```
+
+On the Droplet, post those samples with a `[TEST]` prefix. Only the webhook variable is passed to the script:
+
+```sh
+cd /opt/lft-pipelines
+ALERT_WEBHOOK_URL="$(grep '^ALERT_WEBHOOK_URL=' /etc/lft-pipelines/airflow.env | cut -d= -f2-)" python3 airflow/preview_alerts.py --post
+```
+
 The UI listens on `127.0.0.1:8080` on the Droplet. Open it through a tunnel:
 
 ```sh

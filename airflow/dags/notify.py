@@ -1,52 +1,24 @@
-"""Failure and warning posts for the archive DAG.
+"""Failure callback for the archive DAG.
 
-Stdlib only. The message names the dag, task, try, table and day, plus the
-last log lines. It never reads the process environment, so a secret in the
-environment cannot land in Discord.
+The text is built by ``lft_pipelines.alerts``. This module reads
+``ALERT_WEBHOOK_URL`` only, and only to choose where to post. No other
+environment value is copied into the message.
 """
 
-import json
 import os
-import urllib.request
 
-MAX_CHARS = 1800
-LOG_LINES = 15
+from lft_pipelines.alerts import failure_message, post_discord
 
+__all__ = ["callback_fields", "failure_message", "on_failure", "post_discord"]
 
-def failure_message(context: dict) -> str:
-    """Text for one task failure. ``context`` is a plain dict, not an Airflow object."""
-
-    table = context.get("table") or "-"
-    day = context.get("day") or "-"
-    lines = context.get("log_lines") or []
-    tail = "\n".join(str(line) for line in lines[-LOG_LINES:])
-    text = (
-        f"dag={context.get('dag_id')} task={context.get('task_id')} "
-        f"try={context.get('try_number')} table={table} day={day}\n{tail}"
-    )
-    if len(text) > MAX_CHARS:
-        text = text[: MAX_CHARS - 3] + "..."
-    return text
-
-
-def post_discord(url: str, text: str) -> None:
-    """POST ``{"content": text}``. No-op when ``url`` is empty."""
-
-    if not url:
-        return
-    body = json.dumps({"content": text[:MAX_CHARS]}).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        response.read()
+LOG_READ = 40
 
 
 def on_failure(context) -> None:
-    """Airflow failure callback. No-op when ``ALERT_WEBHOOK_URL`` is unset."""
+    """Airflow failure callback. No-op when ``ALERT_WEBHOOK_URL`` is unset.
+
+    Airflow calls this only after the task's retries are exhausted.
+    """
 
     url = os.environ.get("ALERT_WEBHOOK_URL") or ""
     if not url:
@@ -60,12 +32,15 @@ def callback_fields(context) -> dict:
     task_instance = context.get("task_instance")
     spec = context.get("spec") if isinstance(context.get("spec"), dict) else {}
     dag = context.get("dag")
+    day = spec.get("today") or context.get("day") or "-"
     return {
         "dag_id": getattr(dag, "dag_id", None) or context.get("dag_id"),
         "task_id": getattr(task_instance, "task_id", None) or context.get("task_id"),
         "try_number": getattr(task_instance, "try_number", None) or context.get("try_number"),
         "table": _table_name(context, spec, task_instance),
-        "day": spec.get("today") or context.get("day") or "-",
+        "day": day,
+        "today": context.get("today") or spec.get("today") or day,
+        "exception_line": _exception_line(context, task_instance),
         "log_lines": context.get("log_lines") or _log_tail(task_instance),
     }
 
@@ -89,14 +64,27 @@ def _table_name(context, spec: dict, task_instance) -> str:
     return keys[index]
 
 
+def _exception_line(context, task_instance) -> str:
+    """Last non-empty line of the exception. The traceback stays in the log."""
+
+    exc = context.get("exception")
+    if exc is None and task_instance is not None:
+        exc = getattr(task_instance, "exception", None)
+    if exc is None:
+        return ""
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
 def _log_tail(task_instance) -> list[str]:
+    """Recent log lines. The formatter keeps only a few cleaned ones."""
+
     try_number = getattr(task_instance, "try_number", None)
     if task_instance is None or not hasattr(task_instance, "log_filepath"):
-        exception = getattr(task_instance, "exception", None) if task_instance else None
-        return [] if exception is None else [str(exception)]
+        return []
     path = task_instance.log_filepath
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
-            return handle.read().splitlines()[-LOG_LINES:]
+            return handle.read().splitlines()[-LOG_READ:]
     except OSError:
         return [f"log unreadable try={try_number}"]

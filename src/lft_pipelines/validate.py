@@ -100,17 +100,17 @@ def _check_snapshot(table: TableSpec, today: date, manifests: dict[date, dict], 
         result.findings.append(Finding("fail", "mismatch", today, f"{table.key} snapshot mismatch"))
     previous = _previous_manifest(manifests, today)
     if previous is not None:
-        _columns(table.key, today, payload, previous, result)
+        _columns(table, today, payload, previous, result)
 
 
 def _check_payload(table: TableSpec, day: date, payload: dict, manifests: dict[date, dict], result: ValidationResult) -> None:
     if payload.get("mismatch"):
         result.findings.append(Finding("fail", "mismatch", day, f"{table.key} {day.isoformat()} row_count != db_count"))
     _bounds(table, day, payload, result)
-    _size(table.key, day, payload, manifests, result)
+    _size(table, day, payload, manifests, result)
     previous = _previous_manifest(manifests, day)
     if previous is not None:
-        _columns(table.key, day, payload, previous, result)
+        _columns(table, day, payload, previous, result)
 
 
 def _bounds(table: TableSpec, day: date, payload: dict, result: ValidationResult) -> None:
@@ -120,8 +120,9 @@ def _bounds(table: TableSpec, day: date, payload: dict, result: ValidationResult
             continue
         if not _inside_day(value, table.column_kind, day):
             result.findings.append(
-                Finding("warn", "outside_day", day, f"{table.key} {label} {value} is outside {day.isoformat()}")
+                Finding("warn", "outside_day", day, f"{_subject(table, day)}: a timestamp falls outside that Chicago day")
             )
+            return
 
 
 def _inside_day(value, column_kind: str, day: date) -> bool:
@@ -133,7 +134,7 @@ def _inside_day(value, column_kind: str, day: date) -> bool:
     return chicago_date(parsed, "timestamptz") == day
 
 
-def _size(table: str, day: date, payload: dict, manifests: dict[date, dict], result: ValidationResult) -> None:
+def _size(table: TableSpec, day: date, payload: dict, manifests: dict[date, dict], result: ValidationResult) -> None:
     prior = [manifests[key].get("row_count") or 0 for key in sorted(manifests) if key < day][-7:]
     if len(prior) < 3:
         return
@@ -142,14 +143,36 @@ def _size(table: str, day: date, payload: dict, manifests: dict[date, dict], res
     low = 0.5 * middle
     high = 2 * middle
     if rows < low or rows > high:
+        result.findings.append(Finding("warn", "row_band", day, _row_band_message(table, day, rows, middle)))
+
+
+def _row_band_message(table: TableSpec, day: date, rows: float, middle: float) -> str:
+    """How far this day sits from the recent median, in plain language."""
+
+    subject = _subject(table, day)
+    if middle <= 0:
+        return f"{subject}: row count is outside the recent range"
+    if rows < middle:
+        percent = round((1 - rows / middle) * 100)
+        return f"{subject}: {percent}% fewer rows than the 7-day median"
+    percent = round((rows / middle - 1) * 100)
+    return f"{subject}: {percent}% more rows than the 7-day median"
+
+
+def _columns(table: TableSpec, day: date, payload: dict, previous: dict, result: ValidationResult) -> None:
+    if payload.get("columns") != previous.get("columns"):
         result.findings.append(
-            Finding("warn", "row_band", day, f"{table} rows={rows} outside [{low:.0f}, {high:.0f}]")
+            Finding("warn", "columns", day, f"{_subject(table, day)}: the columns changed from the previous copy")
         )
 
 
-def _columns(table: str, day: date, payload: dict, previous: dict, result: ValidationResult) -> None:
-    if payload.get("columns") != previous.get("columns"):
-        result.findings.append(Finding("warn", "columns", day, f"{table} columns differ from the previous manifest"))
+def _subject(table: TableSpec, day: date) -> str:
+    """``train positions, Nov 9`` for a warning bullet."""
+
+    return f"{table.label}, {_MONTHS[day.month - 1]} {day.day}"
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 def _previous_manifest(manifests: dict[date, dict], day: date) -> dict | None:

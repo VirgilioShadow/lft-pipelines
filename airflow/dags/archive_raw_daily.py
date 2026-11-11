@@ -108,11 +108,10 @@ def archive_raw_daily():
         Imports stay inside this function. Only its source is sent to the venv.
         """
 
-        import json
         import os
-        import urllib.request
         from datetime import date
 
+        from lft_pipelines.alerts import post_discord, warning_message
         from lft_pipelines.registry import resolve_tables
         from lft_pipelines.storage import open_store
         from lft_pipelines.validate import format_validation, validate_table
@@ -124,7 +123,7 @@ def archive_raw_daily():
         end = date.fromisoformat(specs[0]["end"])
         store = open_store(os.environ["ARCHIVE_URL"])
         warnings = []
-        failed = False
+        failed_names = []
         for spec in specs:
             table = resolve_tables(spec["table_key"])[0]
             found = dict(store.list_manifests(table.schema, table.table, start, end))
@@ -137,18 +136,14 @@ def archive_raw_daily():
             result = validate_table(table, today, found, start=start, end=end)
             print(format_validation(result))
             if not result.ok:
-                failed = True
+                failed_names.append(table.label)
             warnings.extend(item.message for item in result.warnings)
         url = os.environ.get("ALERT_WEBHOOK_URL") or ""
         if warnings and url:
-            text = "archive warnings\n" + "\n".join(warnings)
-            body = json.dumps({"content": text[:1800]}).encode("utf-8")
-            request = urllib.request.Request(
-                url, data=body, headers={"content-type": "application/json"}, method="POST"
-            )
-            urllib.request.urlopen(request, timeout=10).read()
-        if failed:
-            raise RuntimeError("archive validation failed")
+            post_discord(url, warning_message(today, warnings))
+        if failed_names:
+            names = ", ".join(failed_names)
+            raise RuntimeError(f"archive check failed for {names}")
         return {"warnings": len(warnings)}
 
     @task
