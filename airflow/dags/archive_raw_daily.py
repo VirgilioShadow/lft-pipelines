@@ -102,6 +102,17 @@ def archive_raw_daily():
             "mismatches": sum(1 for item in results if item.manifest and item.manifest.get("mismatch")),
         }
 
+    @task(trigger_rule="all_done")
+    def collect(extracted) -> list[dict]:
+        """Turn the mapped extract results into a plain list.
+
+        ``validate`` runs in /opt/lft-venv and receives its arguments by pickle.
+        Airflow's lazy XCom sequence cannot be pickled there, so this task
+        materializes it first. Failed map indexes have no result and are left out.
+        """
+
+        return [dict(item) for item in extracted if isinstance(item, dict)]
+
     @task.external_python(python=PYTHON, trigger_rule="all_done", expect_airflow=False)
     def validate(specs: list[dict], extracted: list[dict]) -> dict:
         """Fail when a settled manifest is missing or mismatched. Warn once per new partition.
@@ -159,7 +170,7 @@ def archive_raw_daily():
 
     specs = plan_run()
     extracted = extract_table.expand(spec=specs)
-    checked = validate(specs, extracted)
+    checked = validate(specs, collect(extracted))
     beat = heartbeat(checked)
     beat.set_upstream(extracted)
 
